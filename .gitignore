@@ -30,3 +30,22 @@
 *.exe
 *.out
 *.app
+
+# Visualization files
+*.vtk
+
+# Text files
+*.tex
+*.text
+
+# Temporary file
+*~
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# Application binary
+spectral-fractional-laplacian
