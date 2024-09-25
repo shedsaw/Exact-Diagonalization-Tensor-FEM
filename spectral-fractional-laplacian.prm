@@ -7,19 +7,24 @@ subsection Mesh & geometry parameters
 
   # Select the starting level of refinement
   set Starting refinement = 2
-
+  
   # Select the ending level of refinement
   set Ending refinement = 6
 end
 
 subsection Source term
   # Select the right hand side: single sinusoidal mode (SM), three sinusoidal modes (MM), Bessel function of the first kind (BE)
-  # BE should only be used with the CIRCULAR geometry. 
   set Source term = SM
 end
 
 subsection Problem configuration
+  # Set the height where the extended dimension is truncated
+  set Height = 10.0
+
   # Set the fractional power of the Laplacian operator
   set Fractional power = 0.25
+  
+  # Set the number of eigenvalue/eigenfunction pairs to compute and apply
+  set Number of eigenpairs = 32000
 end
 

@@ -1,4 +1,4 @@
-/* ---------------------------------------------------------------------
+ /* ---------------------------------------------------------------------
  *
  * Copyright (C) 2009 - 2021 by the deal.II authors
  *
@@ -42,6 +42,7 @@
 
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_tools.h>
+#include <deal.II/dofs/dof_renumbering.h>
 
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_values.h>
@@ -59,6 +60,11 @@
 #include <deal.II/lac/solver_cg.h>
 #include <deal.II/lac/precondition.h>
 #include <deal.II/lac/linear_operator_tools.h>
+
+#include <deal.II/lac/petsc_vector.h>
+#include <deal.II/lac/petsc_sparse_matrix.h>
+#include <deal.II/lac/petsc_solver.h>
+#include <deal.II/lac/petsc_precondition.h>
 
 #include <complex>
 #include <fstream>
@@ -118,16 +124,29 @@ namespace SpectralFractionalLaplacian
     {
       prm.declare_entry("Source term", "SM", Patterns::Selection("SM|MM|BE"),
 			"Select the right hand side: single sinusoidal mode (SM), "
-			"three sinusoidal modes (MM), Bessel function of the first kind (BE)"); 
+			"three sinusoidal modes (MM), Bessel function of the first kind (BE)");
+ 
+      prm.declare_entry("omega", "5.0e7", Patterns::Double(0), "Frequency");
     }
     prm.leave_subsection();
  
+ 
     prm.enter_subsection("Problem configuration");
     {
+      prm.declare_entry("Height",
+                        "10.0",
+                        Patterns::Double(0.0),
+                        "Set the height where the extended dimension is truncated");
+
       prm.declare_entry("Fractional power",
                         "0.5",
                         Patterns::Double(0.0,1.0),
                         "Set the fractional power of the Laplacian operator");
+
+      prm.declare_entry("Number of eigenpairs",
+                        "1000",
+                        Patterns::Integer(1),
+                        "Set the number of eigenvalue/eigenfunction pairs to compute and apply");
     }
     prm.leave_subsection();
   }
@@ -285,18 +304,22 @@ namespace SpectralFractionalLaplacian
     FE_Q<dim>          fe;
     DoFHandler<dim>    dof_handler;
 
-    SparsityPattern      sparsity_pattern;
-    SparseMatrix<double> system_matrix;
-    SparseMatrix<double> mass_matrix;
-    SparseMatrix<double> stiffness_matrix;
+    PETScWrappers::SparseMatrix system_matrix;
+    PETScWrappers::SparseMatrix mass_matrix;
+    PETScWrappers::SparseMatrix stiffness_matrix;
+
     AffineConstraints<double> constraints;
-    
+
+    PETScWrappers::MPI::Vector p_solution;
+    PETScWrappers::MPI::Vector p_system_rhs;
+    PETScWrappers::MPI::Vector p_system_rhs_base;
+
     Vector<double> solution;
     Vector<double> system_rhs;
     Vector<double> system_rhs_base;
+    
     Vector<double> local_solution;   // Local contribution to global solution.
     Vector<double> global_solution;  // Full global solution.
-
     
     std::vector<double>      evs;
     std::vector<double>      efs;
@@ -310,6 +333,9 @@ namespace SpectralFractionalLaplacian
     double s, Y;
 
     MPI_Comm mpi_communicator;
+    int my_color;
+    MPI_Comm local_comm;
+    MPI_Group group_world;
     ConditionalOStream pcout;
   };
 
@@ -332,8 +358,19 @@ namespace SpectralFractionalLaplacian
     prm.leave_subsection();
 
     prm.enter_subsection("Problem configuration");
+    Y = prm.get_double("Height");
     s = prm.get_double("Fractional power");
+    num_eigen_pairs = prm.get_integer("Number of eigenpairs");
     prm.leave_subsection();
+
+    int ierr=-1;
+    int my_rank=-1;
+    
+    my_color = Utilities::MPI::this_mpi_process( mpi_communicator );
+    
+    ierr = MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+
+    ierr = MPI_Comm_split(MPI_COMM_WORLD, my_color, my_rank, &local_comm);  
   }
 
   template <int dim>
@@ -364,25 +401,37 @@ namespace SpectralFractionalLaplacian
     pcout << "Number of degrees of freedom: " << dof_handler.n_dofs()
 	  << std::endl;
 
-    DoFTools::make_hanging_node_constraints( dof_handler, constraints );
-    DoFTools::make_zero_boundary_constraints( dof_handler, 0, constraints );
+    pcout << "Number of locally owned degrees of freedom: " << dof_handler.n_locally_owned_dofs()
+	  << std::endl;
+ 
+    DoFTools::make_zero_boundary_constraints(dof_handler, constraints);
     constraints.close();
-  
-    unsigned n_dofs = dof_handler.n_dofs();
-    sparsity_pattern.reinit( n_dofs, n_dofs, dof_handler.max_couplings_between_dofs() );
-    DoFTools::make_sparsity_pattern( dof_handler, sparsity_pattern );
-    constraints.condense( sparsity_pattern );
-    sparsity_pattern.compress();
+
+    DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
+
     
-    mass_matrix.reinit( sparsity_pattern );
-    stiffness_matrix.reinit( sparsity_pattern );
-    system_matrix.reinit( sparsity_pattern );
+    stiffness_matrix.reinit(dof_handler.n_dofs(),
+                            dof_handler.n_dofs(),
+                            dof_handler.max_couplings_between_dofs());
+    mass_matrix.reinit(dof_handler.n_dofs(),
+		       dof_handler.n_dofs(),
+                       dof_handler.max_couplings_between_dofs());
     
-    solution.reinit( dof_handler.n_dofs() );
-    system_rhs_base.reinit( dof_handler.n_dofs() );
-    system_rhs.reinit( dof_handler.n_dofs() );
+    system_matrix.reinit(dof_handler.n_dofs(),
+                         dof_handler.n_dofs(),
+                         dof_handler.max_couplings_between_dofs());
+    
     local_solution.reinit( dof_handler.n_dofs() );
     global_solution.reinit( dof_handler.n_dofs() );
+
+    p_solution.clear();
+    p_solution.reinit( local_comm, dof_handler.n_locally_owned_dofs(), dof_handler.n_locally_owned_dofs() );
+
+    p_system_rhs.clear();
+    p_system_rhs.reinit( local_comm, dof_handler.n_locally_owned_dofs(), dof_handler.n_locally_owned_dofs() );
+
+    p_system_rhs_base.clear();
+    p_system_rhs_base.reinit( local_comm, dof_handler.n_locally_owned_dofs(), dof_handler.n_locally_owned_dofs() );
   }
 
   template <int dim>
@@ -398,22 +447,198 @@ namespace SpectralFractionalLaplacian
     RightHandSideBE<dim> right_hand_sideBE(s);
 
     if ( source == single_mode ) {
-      MatrixCreator::create_mass_matrix( dof_handler, quadrature_formula, mass_matrix,
-					 right_hand_sideSM, system_rhs_base );
+      QGauss<dim> quadrature_formula(fe.degree + 1);
+      
+      FEValues<dim> fe_values(fe,
+			      quadrature_formula,
+			      update_values | update_gradients |
+			      update_quadrature_points | update_JxW_values);
+    
+      const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
-      MatrixCreator::create_laplace_matrix( dof_handler, quadrature_formula, stiffness_matrix );
+      FullMatrix<double> cell_mass_matrix(dofs_per_cell, dofs_per_cell);
+      FullMatrix<double> cell_stiffness_matrix(dofs_per_cell, dofs_per_cell);
+      Vector<double>     cell_rhs(dofs_per_cell);
+
+      std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+      
+      for (const auto &cell : dof_handler.active_cell_iterators()) {
+	fe_values.reinit(cell);
+
+	cell_mass_matrix      = 0;
+	cell_stiffness_matrix = 0;
+	cell_rhs              = 0;
+
+	for (const unsigned int q_index : fe_values.quadrature_point_indices()) {
+	  for (const unsigned int i : fe_values.dof_indices())
+	    for (const unsigned int j : fe_values.dof_indices()) {
+	      cell_mass_matrix(i,j) += ( fe_values.shape_value(i, q_index)  *   // phi_i(x_q)
+					 fe_values.shape_value(j, q_index)) *   // phi_j(x_q)
+		                         fe_values.JxW(q_index);                  // dx
+
+	      cell_stiffness_matrix(i,j) += ( fe_values.shape_grad(i, q_index)  *   // grad phi_i(x_q)
+					      fe_values.shape_grad(j, q_index)) *   // grad phi_j(x_q)
+	                                      fe_values.JxW(q_index);                 // dx
+	    
+	    }
+	    
+	
+	  const auto &x_q = fe_values.quadrature_point(q_index);
+	  for (const unsigned int i : fe_values.dof_indices())
+	    cell_rhs(i) += (fe_values.shape_value(i, q_index) * // phi_i(x_q)
+			    right_hand_sideSM.value(x_q) *        // f(x_q)
+			    fe_values.JxW(q_index));            // dx
+	}
+
+	cell->get_dof_indices(local_dof_indices);
+
+	constraints.distribute_local_to_global(cell_stiffness_matrix,
+                                               local_dof_indices,
+                                               stiffness_matrix);
+        constraints.distribute_local_to_global(cell_mass_matrix,
+                                               local_dof_indices,
+                                               mass_matrix);
+	constraints.distribute_local_to_global(cell_mass_matrix,
+                                               local_dof_indices,
+                                               system_matrix);
+	
+	for (const unsigned int i : fe_values.dof_indices())
+	  p_system_rhs_base(local_dof_indices[i]) += cell_rhs(i);
+      }
+      stiffness_matrix.compress(VectorOperation::add);
+      mass_matrix.compress(VectorOperation::add);
+      system_matrix.compress(VectorOperation::add);
+      p_system_rhs_base.compress(VectorOperation::add);
     }
     else if ( source == multiple_modes ) {
-      MatrixCreator::create_mass_matrix( dof_handler, quadrature_formula, mass_matrix,
-					 right_hand_sideMM, system_rhs_base );
+      QGauss<dim> quadrature_formula(fe.degree + 1);
+      
+      FEValues<dim> fe_values(fe,
+			      quadrature_formula,
+			      update_values | update_gradients |
+			      update_quadrature_points | update_JxW_values);
+    
+      const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
-      MatrixCreator::create_laplace_matrix( dof_handler, quadrature_formula, stiffness_matrix );
+      FullMatrix<double> cell_mass_matrix(dofs_per_cell, dofs_per_cell);
+      FullMatrix<double> cell_stiffness_matrix(dofs_per_cell, dofs_per_cell);
+      Vector<double>     cell_rhs(dofs_per_cell);
+
+      std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+      
+      for (const auto &cell : dof_handler.active_cell_iterators()) {
+	fe_values.reinit(cell);
+
+	cell_mass_matrix      = 0;
+	cell_stiffness_matrix = 0;
+	cell_rhs              = 0;
+
+	for (const unsigned int q_index : fe_values.quadrature_point_indices()) {
+	  for (const unsigned int i : fe_values.dof_indices())
+	    for (const unsigned int j : fe_values.dof_indices()) {
+	      cell_mass_matrix(i,j) += ( fe_values.shape_value(i, q_index)  *   // phi_i(x_q)
+					 fe_values.shape_value(j, q_index)) *   // phi_j(x_q)
+		                         fe_values.JxW(q_index);                  // dx
+
+	      cell_stiffness_matrix(i,j) += ( fe_values.shape_grad(i, q_index)  *   // grad phi_i(x_q)
+					      fe_values.shape_grad(j, q_index)) *   // grad phi_j(x_q)
+	                                      fe_values.JxW(q_index);                 // dx
+	    
+	    }
+	    
+	
+	  const auto &x_q = fe_values.quadrature_point(q_index);
+	  for (const unsigned int i : fe_values.dof_indices())
+	    cell_rhs(i) += (fe_values.shape_value(i, q_index) * // phi_i(x_q)
+			    right_hand_sideMM.value(x_q) *        // f(x_q)
+			    fe_values.JxW(q_index));            // dx
+	}
+
+	cell->get_dof_indices(local_dof_indices);
+
+	constraints.distribute_local_to_global(cell_stiffness_matrix,
+                                               local_dof_indices,
+                                               stiffness_matrix);
+        constraints.distribute_local_to_global(cell_mass_matrix,
+                                               local_dof_indices,
+                                               mass_matrix);
+	constraints.distribute_local_to_global(cell_mass_matrix,
+                                               local_dof_indices,
+                                               system_matrix);
+
+	for (const unsigned int i : fe_values.dof_indices())
+	  p_system_rhs_base(local_dof_indices[i]) += cell_rhs(i);
+      }
+
+      stiffness_matrix.compress(VectorOperation::add);
+      mass_matrix.compress(VectorOperation::add);
+      system_matrix.compress(VectorOperation::add);
+      p_system_rhs_base.compress(VectorOperation::add);
     }
     else if ( source == bessel ) {
-      MatrixCreator::create_mass_matrix( dof_handler, quadrature_formula, mass_matrix,
-					 right_hand_sideBE, system_rhs_base );
+      QGauss<dim> quadrature_formula(fe.degree + 1);
+      
+      FEValues<dim> fe_values(fe,
+			      quadrature_formula,
+			      update_values | update_gradients |
+			      update_quadrature_points | update_JxW_values);
+    
+      const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
-      MatrixCreator::create_laplace_matrix( dof_handler, quadrature_formula, stiffness_matrix );
+      FullMatrix<double> cell_mass_matrix(dofs_per_cell, dofs_per_cell);
+      FullMatrix<double> cell_stiffness_matrix(dofs_per_cell, dofs_per_cell);
+      Vector<double>     cell_rhs(dofs_per_cell);
+
+      std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+      
+      for (const auto &cell : dof_handler.active_cell_iterators()) {
+	fe_values.reinit(cell);
+
+	cell_mass_matrix      = 0;
+	cell_stiffness_matrix = 0;
+	cell_rhs              = 0;
+
+	for (const unsigned int q_index : fe_values.quadrature_point_indices()) {
+	  for (const unsigned int i : fe_values.dof_indices())
+	    for (const unsigned int j : fe_values.dof_indices()) {
+	      cell_mass_matrix(i,j) += ( fe_values.shape_value(i, q_index)  *   // phi_i(x_q)
+					 fe_values.shape_value(j, q_index)) *   // phi_j(x_q)
+		                         fe_values.JxW(q_index);                  // dx
+
+	      cell_stiffness_matrix(i,j) += ( fe_values.shape_grad(i, q_index)  *   // grad phi_i(x_q)
+					      fe_values.shape_grad(j, q_index)) *   // grad phi_j(x_q)
+	                                      fe_values.JxW(q_index);                 // dx
+	    
+	    }
+	    
+	
+	  const auto &x_q = fe_values.quadrature_point(q_index);
+	  for (const unsigned int i : fe_values.dof_indices())
+	    cell_rhs(i) += (fe_values.shape_value(i, q_index) * // phi_i(x_q)
+			    right_hand_sideBE.value(x_q) *        // f(x_q)
+			    fe_values.JxW(q_index));            // dx
+	}
+
+	cell->get_dof_indices(local_dof_indices);
+
+	constraints.distribute_local_to_global(cell_stiffness_matrix,
+                                               local_dof_indices,
+                                               stiffness_matrix);
+        constraints.distribute_local_to_global(cell_mass_matrix,
+                                               local_dof_indices,
+                                               mass_matrix);
+	constraints.distribute_local_to_global(cell_mass_matrix,
+                                               local_dof_indices,
+                                               system_matrix);
+
+	for (const unsigned int i : fe_values.dof_indices())
+	  p_system_rhs_base(local_dof_indices[i]) += cell_rhs(i);
+      }
+
+      stiffness_matrix.compress(VectorOperation::add);
+      mass_matrix.compress(VectorOperation::add);
+      system_matrix.compress(VectorOperation::add);
+      p_system_rhs_base.compress(VectorOperation::add);
     }
     else {
       pcout<<"  Something went terribly wrong in assemble_system()!"<<std::endl;
@@ -423,12 +648,18 @@ namespace SpectralFractionalLaplacian
 
   template <int dim>
   void SpectralFractionalLaplace<dim>::solve() {
+    
     SolverControl solver_control(1000, 1e-12);
-    SolverCG<Vector<double>> solver(solver_control);
-    PreconditionSSOR<SparseMatrix<double> > preconditioner;
-    preconditioner.initialize( system_matrix, 1.61 );
-    solver.solve( system_matrix, solution, system_rhs, preconditioner );
-    constraints.distribute( solution );
+    PETScWrappers::SolverCG cg(solver_control);
+    PETScWrappers::PreconditionSOR preconditioner(system_matrix);
+
+    cg.solve(system_matrix, p_solution, p_system_rhs, preconditioner);
+
+    Vector<double> localized_solution(p_solution);
+    constraints.distribute(localized_solution);
+    solution = localized_solution;
+
+    return;
   }
   
   template <int dim>
@@ -448,13 +679,19 @@ namespace SpectralFractionalLaplacian
   template <int dim>
   void SpectralFractionalLaplace<dim>::run() {
     double starttime, endtime;
+    unsigned int nprocs = Utilities::MPI::n_mpi_processes( mpi_communicator );
+    unsigned int my_id  = Utilities::MPI::this_mpi_process( mpi_communicator );
+    MPI_Barrier(mpi_communicator);
     starttime = MPI_Wtime();
+    
     pcout<<" From spectral-fractional-laplacian.prm:"<<std::endl;
     pcout<<"   Geometry            - "<<geometry<<std::endl;
     pcout<<"   Starting refinement - "<<starting_refinements<<std::endl;
     pcout<<"   Ending refinement   - "<<ending_refinements<<std::endl;
-    pcout<<"   Source term         - "<<source<<std::endl;
+    pcout<<"   Source tern         - "<<source<<std::endl;
+    pcout<<"   Y                   - "<<Y<<std::endl;
     pcout<<"   s                   - "<<s<<std::endl;
+    pcout<<"   Number of eigenpairs- "<<num_eigen_pairs<<std::endl;
 
     const bool isSqrt = fabs( s - 0.5 )<1e-12;
     double etak=0.0, muk=0.0, vk=0.0, Ak=1.0;
@@ -462,48 +699,74 @@ namespace SpectralFractionalLaplacian
     // Assemble the base mass and stiffness matrices. along with the base right hand side.
     double ds = std::pow(2, 1.0-2.0*s)*std::tgamma(1.0-s)/std::tgamma(s);
 
+    std::string local_filename = "rank-"+std::to_string(my_id)+".txt";
+    std::ofstream local_output{ local_filename,std::ofstream::out };
+      
+    double starttime_local, stoptime_local;
+    double start_setup, end_setup;
+    double start_eigenpairs;
+    MPI_Barrier(mpi_communicator);
+    starttime_local = MPI_Wtime();
+    
     for ( unsigned int nrefine = starting_refinements; nrefine <= ending_refinements; nrefine++) {
-
       pcout<<"Starting refinement level "<<nrefine<<std::endl;
 
+      // Define string from split colour and use to set comm name
+      std::string name = "Comm-";
+      name += std::to_string(my_color);
+      const char * commname = name.c_str();
+      MPI_Comm_set_name(local_comm, commname);
+      
+      int split_rank;
+      MPI_Group split_group;
+      MPI_Comm_group(local_comm, &split_group);
+      MPI_Comm_rank(local_comm, &split_rank);
+      
+      //Retrieve commname and print
+      int rlen;
+      char nameout[MPI_MAX_OBJECT_NAME];
+      MPI_Comm_get_name(local_comm, nameout, &rlen);
+
+      local_output << "rank: " << split_rank << " | comm: " << local_comm << " , comm_name: " << nameout << " , group: " << split_group << std::endl;
+      
+      local_output<<"On Refinement level "<<nrefine<<std::endl;
+      
       double grid_size = 1.0 / ( std::pow( 2.0 , (double)nrefine ));
       Y = 2.0*s*std::fabs( std::log(grid_size) );
       num_eigen_pairs = Y / grid_size;
 
       pcout<<"    On refinement level "<<nrefine<<", h is "<<grid_size<<", Y is "<<Y<<", and N is "<<num_eigen_pairs<<std::endl;
+      local_output<<"    On refinement level "<<nrefine<<", h is "<<grid_size<<", Y is "<<Y<<", and N is "<<num_eigen_pairs<<std::endl;
       
-      // Determine how many eigenpairs for which this process is responsible.
-      unsigned int nprocs = Utilities::MPI::n_mpi_processes( mpi_communicator );
-      unsigned int npairs_per_proc = num_eigen_pairs / nprocs;
-      
-      unsigned int start_pair = Utilities::MPI::this_mpi_process(mpi_communicator) * npairs_per_proc;
-      unsigned int stop_pair  = (Utilities::MPI::this_mpi_process(mpi_communicator)+1) * npairs_per_proc;
-
-      if ( Utilities::MPI::this_mpi_process(mpi_communicator)==(nprocs-1) ) {
-	stop_pair = num_eigen_pairs; }
-
-      pcout<<" Start_pair = "<<start_pair<<" and end_pair = "<<stop_pair<<std::endl;
-
-      for( unsigned k = start_pair; k<stop_pair; ++k ) {
-	if( isSqrt ) {
-	  etak = numbers::PI*( double(k) + 0.5 );
-	  muk = (etak*etak)/(Y*Y);
-	  vk = std::sqrt(2.0/Y);
-	}
-	else {
-	  etak = boost::math::cyl_bessel_j_zero( -s, k+1 );
-	  muk = (etak*etak)/(Y*Y);
-	  try{
-	    Ak = (std::sqrt(2.0)*std::cos( s * numbers::PI ))/ (std::pow( muk , 0.5*s) * Y * boost::math::cyl_bessel_j( 1.0 - s, etak));
-	  } catch( ... ) {
-	    std::cerr<<"  Something bad happened in the call to boost::math::cyl_bessel_j_zero()."<<std::endl;
+      // Compute the eigenpairs.
+      for ( unsigned int j=0; j < num_eigen_pairs; j++ )  {
+	if ( (j % nprocs) == my_id )  {
+	  if( isSqrt ) {
+	    etak = numbers::PI*( double(j) + 0.5 );
+	    muk = (etak*etak)/(Y*Y);
+	    vk = std::sqrt(2.0/Y);
 	  }
-	  vk = ( std::pow(2.0,s) * Ak )/( std::cos( numbers::PI*s ) * std::tgamma( 1.0-s) );
+	  else  {
+	    etak = boost::math::cyl_bessel_j_zero( -s, j+1 );
+	    muk = (etak*etak)/(Y*Y);
+	    try  {
+	      Ak = (std::sqrt(2.0)*std::cos( s * numbers::PI ))/ (std::pow( muk , 0.5*s) * Y * boost::math::cyl_bessel_j( 1.0 - s, etak));
+	    }  catch( ... )  {
+	      std::cerr<<"  Something bad happened in the call to boost::math::cyl_bessel_j_zero()."<<std::endl;
+	    }
+	    vk = ( std::pow(2.0,s) * Ak )/( std::cos( numbers::PI*s ) * std::tgamma( 1.0-s) );
+	  }
+	  evs.push_back(muk);
+	  efs.push_back(vk);
 	}
-	evs.push_back(muk);
-	efs.push_back(vk);
       }
+
+      unsigned int local_num_eigen_pairs = evs.size();
       
+      local_output << "Number of eigenpairs is "<<local_num_eigen_pairs<<std::endl;
+      MPI_Barrier(mpi_communicator);
+      start_setup = MPI_Wtime();
+
       // Now solve the associated Poisson problems.
       // After the first go through of the loop, we need to clean out the previous grid data.
       if (nrefine > starting_refinements) {
@@ -518,43 +781,65 @@ namespace SpectralFractionalLaplacian
       make_grid(nrefine);
       setup_system();
       assemble_system();
-
+      
       local_solution  = 0.0;
       global_solution = 0.0;
 
-      unsigned int time_to_print = (stop_pair-start_pair) / 4;
+      end_setup = MPI_Wtime();
+      local_output<<"Triangulation and grid setup time = "<<std::setprecision(8)<<(end_setup-start_setup)<<std::endl;
+      
+      unsigned int time_to_print = local_num_eigen_pairs/4;
       unsigned int counter = 0;
+	
       
       // Now loop over all the eigenpairs this process is responsible for.
-      for (unsigned int nep = 0; nep < (stop_pair-start_pair); nep++) {
+      double batch_start, batch_end;
+
+      // Make sure we've all finished.
+      MPI_Barrier(mpi_communicator);
+
+      start_eigenpairs = MPI_Wtime();
+      batch_start = MPI_Wtime();
+	
+      counter = 0;
+      
+      for (unsigned int nep = 0; nep < local_num_eigen_pairs; nep++) {
 
 	if ( counter == time_to_print ) {
-	  pcout<<" Working on eigen pair "<<nep<<" out of "<<(stop_pair-start_pair)<<std::endl;
+	  pcout<<" Working on eigen pair "<<nep<<" out of "<<local_num_eigen_pairs<<std::endl;
 	  counter = 1;
 	}
 	else {
 	  counter++;
 	}
-	
-	// Copy the mass matrix to the system matrix and then add eigenvalue * stiffness matrix
-	system_matrix.copy_from(stiffness_matrix);
-	system_matrix.add( evs[nep], mass_matrix);
 
-	
-	// Copy the base system right-hand side vector and then scale it by d_s times the eigenfunction value
-	system_rhs = system_rhs_base;
-	system_rhs *= ( ds * efs[nep] );
+	system_matrix = 0.0;
+	system_matrix.add(1.0 , stiffness_matrix);
+	system_matrix.add( evs[nep] , mass_matrix);
 
-	// Condense the matrices and right hand side to handle boundary conditions.
-	constraints.condense( system_matrix, system_rhs );
-      
+	p_system_rhs = p_system_rhs_base;
+	p_system_rhs *= ( ds * efs[nep] );
+
+	p_system_rhs.compress(VectorOperation::add);
+	p_solution.compress(VectorOperation::add);
+
+	system_matrix.compress(VectorOperation::add);
+	
 	solve();
-      
-	// Add a multiple of the current solution to the local Fractional solution
-	local_solution.add(efs[nep] , solution);	
-	system_matrix.reinit(sparsity_pattern);
-      }
 
+	local_solution.add(efs[nep] , solution);
+      } // end loop over eigenpairs
+      
+      batch_end = MPI_Wtime();
+      local_output<<std::setprecision(8)<<(batch_end-batch_start)<<std::endl;
+      local_output<<"Loop over eigenpairs = "<<std::setprecision(8)<<(batch_end-start_eigenpairs)<<std::endl;
+      
+      // Make sure we've all finished.
+      MPI_Barrier(mpi_communicator);
+      
+      stoptime_local = MPI_Wtime();
+      local_output<<"Local runtime is "<<std::setprecision(8)<<(stoptime_local-starttime_local)<<" seconds, "<<std::endl;
+      
       // Collect all local results and combine them to the global solution.
       Utilities::MPI::sum (local_solution, mpi_communicator, global_solution );
 
@@ -568,7 +853,7 @@ namespace SpectralFractionalLaplacian
 
       Vector<double> difference_per_cell(triangulation.n_active_cells());
       double grid_spacing = 1.0 / ( std::pow( 2.0 , (double)nrefine ));
-
+      
       const std::string single_mode    = "SM";
       const std::string multiple_modes = "MM";
       const std::string bessel         = "BE";
@@ -585,7 +870,7 @@ namespace SpectralFractionalLaplacian
 	VectorTools::integrate_difference(dof_handler,global_solution,SolutionMM<dim>(),difference_per_cell,QGauss<dim>(2),VectorTools::L2_norm);
       if ( source == bessel )
 	VectorTools::integrate_difference(dof_handler,global_solution,SolutionBE<dim>(),difference_per_cell,QGauss<dim>(2),VectorTools::L2_norm);
-      
+	
       double l2_error =
 	VectorTools::compute_global_error(triangulation,
 					  difference_per_cell,
@@ -620,7 +905,7 @@ namespace SpectralFractionalLaplacian
 					  VectorTools::mean);
       
       hs_error = std::sqrt( std::fabs(hs_error) );
-      
+	
       const unsigned int n_active_cells = triangulation.n_active_cells();
       const unsigned int n_dofs         = dof_handler.n_dofs();
     
@@ -630,11 +915,16 @@ namespace SpectralFractionalLaplacian
       convergence_table.add_value("L2", l2_error);
       convergence_table.add_value("H1", h1_error);
       convergence_table.add_value("|H_s", hs_error);
-
+      
       evs.clear();
       efs.clear();
+
+      local_output<<std::endl; 
       
-    }
+    } // End loop over refinement levels.
+
+    local_output.close();
+    
     convergence_table.set_precision("L2", 5);
     convergence_table.set_precision("H1", 5);
     convergence_table.set_precision("|H_s", 5);
@@ -659,13 +949,11 @@ namespace SpectralFractionalLaplacian
       pcout << std::endl;
       convergence_table.write_text(std::cout);
     
-      //pcout << std::endl;
-      //convergence_table.write_tex(std::cout);
       std::string error_filename = "error.tex";
       std::ofstream error_table_file(error_filename);
       
       convergence_table.write_tex(error_table_file);
-      
+	
       std::string error_filename2 = "error.text";
       std::ofstream error_table_file2(error_filename2);
       const TableHandler::TextOutputFormat format = TableHandler::simple_table_with_separate_column_description;
@@ -679,7 +967,7 @@ namespace SpectralFractionalLaplacian
       new_order.emplace_back("H1");
       new_order.emplace_back("|H_s");
       convergence_table.set_column_order(new_order);
-
+      
       convergence_table.evaluate_convergence_rates("L2", ConvergenceTable::reduction_rate);
       convergence_table.evaluate_convergence_rates("L2", ConvergenceTable::reduction_rate_log2);
       convergence_table.evaluate_convergence_rates("H1", ConvergenceTable::reduction_rate);
@@ -693,7 +981,7 @@ namespace SpectralFractionalLaplacian
       std::string conv_filename = "convergence.tex";
       std::ofstream table_file(conv_filename);
       convergence_table.write_tex(table_file);
-
+	
       std::string   conv_filename2 = "convergence.text";
       std::ofstream table_file2(conv_filename2);
       convergence_table.write_text(table_file2, format);
