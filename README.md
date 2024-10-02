@@ -17,3 +17,5 @@ To run the code,
 ```console
 user@linux:~/Exact-Diagonalization-Tensor-FEM$ mpirun -np $NP ./spectral-fractional-laplacian
 ```
+
+:-)
