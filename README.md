@@ -18,4 +18,3 @@ To run the code,
 user@linux:~/Exact-Diagonalization-Tensor-FEM$ mpirun -np $NP ./spectral-fractional-laplacian
 ```
 
-:-)
